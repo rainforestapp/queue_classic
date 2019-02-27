@@ -3,6 +3,8 @@ require 'pg'
 
 module QC
   class ConnAdapter
+    RESET_POLL_INTERVAL = ENV.fetch("QC_RESET_POLL_INTERVAL", 1).to_i
+    RESET_POLL_TIMEOUT  = ENV.fetch("QC_RESET_POLL_TIMEOUT", 300).to_i
 
     attr_accessor :connection
     def initialize(c=nil)
@@ -20,9 +22,26 @@ module QC
           r.each {|t| result << t}
           result.length > 1 ? result : result.pop
         rescue PG::Error => e
-          QC.log(:error => e.inspect)
+          # Try to reset the connection and check for the reset status
           @connection.reset
-          raise
+          status = @connection.reset_poll
+          reset_poll_timer = 0
+
+          # This waits till we get a connection or until timeout.
+          while(status != PG::PGRES_POLLING_OK) do
+            QC.log(:at => "reset_poll")
+
+            if reset_poll_timer < RESET_POLL_TIMEOUT
+              sleep RESET_POLL_INTERVAL
+              reset_poll_timer += RESET_POLL_INTERVAL
+            else
+              QC.log(:error => e.inspect)
+              raise ConnectionResetException.new(e)
+            end
+
+            @connection.reset
+            status = @connection.reset_poll
+          end
         end
       end
     end
