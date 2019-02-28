@@ -13,16 +13,21 @@ module QC
     def execute(stmt, *params)
       @mutex.synchronize do
         QC.log(:at => "exec_sql", :sql => stmt.inspect)
+        retries = 0
         begin
           params = nil if params.empty?
           r = @connection.exec(stmt, params)
           result = []
           r.each {|t| result << t}
           result.length > 1 ? result : result.pop
-        rescue PGError => e
-          QC.log(:error => e.inspect)
-          @connection.reset
-          raise
+        rescue PG::Error => e
+          if (retries += 1) < 2
+            @connection.reset
+            retry
+          else
+            QC.log(:error => e.inspect)
+            raise
+          end
         end
       end
     end
