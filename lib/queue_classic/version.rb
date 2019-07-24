@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 module QC
-  VERSION = "3.2.0.alpha"
+  VERSION = "4.0.0-alpha1"
 end
