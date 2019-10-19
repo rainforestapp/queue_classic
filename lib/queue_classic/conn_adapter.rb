@@ -1,13 +1,22 @@
+# frozen_string_literal: true
+
 require 'uri'
 require 'pg'
 
 module QC
   class ConnAdapter
 
-    attr_accessor :connection
-    def initialize(c=nil)
-      @connection = c.nil? ? establish_new : validate!(c)
+    def initialize(active_record_connection_share)
+      @active_record_connection_share = active_record_connection_share
       @mutex = Mutex.new
+    end
+
+    def connection
+      if @active_record_connection_share
+        ActiveRecord::Base.connection.raw_connection
+      else
+        @_connection ||= establish_new
+      end
     end
 
     def execute(stmt, *params)
@@ -15,13 +24,13 @@ module QC
         QC.log(:at => "exec_sql", :sql => stmt.inspect)
         begin
           params = nil if params.empty?
-          r = @connection.exec(stmt, params)
+          r = connection.exec(stmt, params)
           result = []
           r.each {|t| result << t}
           result.length > 1 ? result : result.pop
-        rescue PGError => e
+        rescue PG::Error => e
           QC.log(:error => e.inspect)
-          @connection.reset
+          connection.reset
           raise
         end
       end
@@ -30,10 +39,10 @@ module QC
     def wait(time, *channels)
       @mutex.synchronize do
         listen_cmds = channels.map {|c| 'LISTEN "' + c.to_s + '"'}
-        @connection.exec(listen_cmds.join(';'))
+        connection.exec(listen_cmds.join(';'))
         wait_for_notify(time)
         unlisten_cmds = channels.map {|c| 'UNLISTEN "' + c.to_s + '"'}
-        @connection.exec(unlisten_cmds.join(';'))
+        connection.exec(unlisten_cmds.join(';'))
         drain_notify
       end
     end
@@ -41,23 +50,30 @@ module QC
     def disconnect
       @mutex.synchronize do
         begin
-          @connection.close
+          connection.close
         rescue => e
           QC.log(:at => 'disconnect', :error => e.message)
         end
       end
     end
 
+    def server_version
+      @server_version ||= begin
+                            version = execute("SHOW server_version_num;")["server_version_num"]
+                            version && version.to_i
+                          end
+    end
+
     private
 
     def wait_for_notify(t)
       Array.new.tap do |msgs|
-        @connection.wait_for_notify(t) {|event, pid, msg| msgs << msg}
+        connection.wait_for_notify(t) {|event, pid, msg| msgs << msg}
       end
     end
 
     def drain_notify
-      until @connection.notifies.nil?
+      until connection.notifies.nil?
         QC.log(:at => "drain_notifications")
       end
     end
@@ -70,11 +86,16 @@ module QC
 
     def establish_new
       QC.log(:at => "establish_conn")
-      conn = PGconn.connect(*normalize_db_url(db_url))
-      if conn.status != PGconn::CONNECTION_OK
+      conn = PG.connect(*normalize_db_url(db_url))
+      if conn.status != PG::CONNECTION_OK
         QC.log(:error => conn.error)
       end
-      conn.exec("SET application_name = '#{QC::APP_NAME}'")
+
+      if conn.server_version < 90600
+        raise "This version of Queue Classic does not support Postgres older than 9.6 (90600). This version is #{conn.server_version}. If you need that support, please use an older version."
+      end
+
+      conn.exec("SET application_name = '#{QC.app_name}'")
       conn
     end
 
@@ -99,6 +120,5 @@ module QC
             raise(ArgumentError, "missing QC_DATABASE_URL or DATABASE_URL")
       @db_url = URI.parse(url)
     end
-
   end
 end

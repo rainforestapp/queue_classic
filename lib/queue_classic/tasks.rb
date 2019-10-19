@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 task :environment
 
 namespace :jobs do
@@ -8,14 +10,11 @@ end
 namespace :qc do
   desc "Start a new worker for the (default or $QUEUE / $QUEUES) queue"
   task :work  => :environment do
-    @worker = QC::Worker.new
+    @worker = QC.default_worker_class.new
 
     trap('INT') do
-      $stderr.puts("Received INT. Shutting down.")
-      if !@worker.running
-        $stderr.puts("Worker has stopped running. Exit.")
-        exit(1)
-      end
+      $stderr.puts("Received INT. Shutting down.")      
+      abort("Worker has stopped running. Exit.") unless @worker.running
       @worker.stop
     end
 

@@ -7,3 +7,5 @@ etc/
 .env
 Gemfile.lock
 tips-and-tricks.md
+test/reports/
+vendor/
