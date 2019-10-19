@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require_relative 'conn_adapter'
 require 'json'
 require 'time'
@@ -5,11 +7,11 @@ require 'time'
 module QC
   # The queue class maps a queue abstraction onto a database table.
   class Queue
-
     attr_reader :name, :top_bound
+
     def initialize(name, top_bound=nil)
       @name = name
-      @top_bound = top_bound || QC::TOP_BOUND
+      @top_bound = top_bound || QC.top_bound
     end
 
     def conn_adapter=(a)
@@ -34,10 +36,20 @@ module QC
     # The args are stored as a collection and then splatted inside the worker.
     # Examples of args include: `'hello world'`, `['hello world']`,
     # `'hello', 'world'`.
+    # This method returns a hash with the id of the enqueued job.
     def enqueue(method, *args)
       QC.log_yield(:measure => 'queue.enqueue') do
-        s = "INSERT INTO #{TABLE_NAME} (q_name, method, args) VALUES ($1, $2, $3)"
-        conn_adapter.execute(s, name, method, JSON.dump(args))
+        s = "INSERT INTO #{QC.table_name} (q_name, method, args) VALUES ($1, $2, $3) RETURNING id"
+        begin
+          retries ||= 0
+          conn_adapter.execute(s, name, method, JSON.dump(args))
+        rescue PG::Error
+          if (retries += 1) < 2
+            retry
+          else
+            raise
+          end
+        end
       end
     end
 
@@ -46,8 +58,9 @@ module QC
     # The time argument must be a Time object or a float timestamp. The method
     # and args argument must be in the form described in the documentation for
     # the #enqueue method.
+    # This method returns a hash with the id of the enqueued job.
     def enqueue_at(timestamp, method, *args)
-      offset = Time.at(timestamp) - Time.now
+      offset = Time.at(timestamp).to_i - Time.now.to_i
       enqueue_in(offset, method, *args)
     end
 
@@ -56,18 +69,48 @@ module QC
     # The seconds argument must be an integer. The method and args argument
     # must be in the form described in the documentation for the #enqueue
     # method.
+    # This method returns a hash with the id of the enqueued job.
     def enqueue_in(seconds, method, *args)
       QC.log_yield(:measure => 'queue.enqueue') do
-        s = "INSERT INTO #{TABLE_NAME} (q_name, method, args, scheduled_at)
-             VALUES ($1, $2, $3, now() + interval '#{seconds.to_i} seconds')"
-        conn_adapter.execute(s, name, method, JSON.dump(args))
+        s = "INSERT INTO #{QC.table_name} (q_name, method, args, scheduled_at)
+             VALUES ($1, $2, $3, now() + interval '#{seconds.to_i} seconds')
+             RETURNING id"
+        begin
+          retries ||= 0
+          conn_adapter.execute(s, name, method, JSON.dump(args))
+        rescue PG::Error
+          if (retries += 1) < 2
+            retry
+          else
+            raise
+          end
+        end
       end
     end
 
     def lock
       QC.log_yield(:measure => 'queue.lock') do
-        s = "SELECT * FROM lock_head($1, $2)"
-        if r = conn_adapter.execute(s, name, top_bound)
+        s = <<~SQL
+          WITH selected_job AS (
+            SELECT id
+            FROM queue_classic_jobs
+            WHERE
+              locked_at IS NULL AND
+              q_name = $1 AND
+              scheduled_at <= now()
+            LIMIT 1
+            FOR NO KEY UPDATE SKIP LOCKED
+          )
+          UPDATE queue_classic_jobs
+          SET
+            locked_at = now(),
+            locked_by = pg_backend_pid()
+          FROM selected_job
+          WHERE queue_classic_jobs.id = selected_job.id
+          RETURNING *
+        SQL
+
+        if r = conn_adapter.execute(s, name)
           {}.tap do |job|
             job[:id] = r["id"]
             job[:q_name] = r["q_name"]
@@ -85,31 +128,46 @@ module QC
 
     def unlock(id)
       QC.log_yield(:measure => 'queue.unlock') do
-        s = "UPDATE #{TABLE_NAME} set locked_at = null where id = $1"
+        s = "UPDATE #{QC.table_name} SET locked_at = NULL WHERE id = $1"
         conn_adapter.execute(s, id)
       end
     end
 
     def delete(id)
       QC.log_yield(:measure => 'queue.delete') do
-        conn_adapter.execute("DELETE FROM #{TABLE_NAME} where id = $1", id)
+        conn_adapter.execute("DELETE FROM #{QC.table_name} WHERE id = $1", id)
       end
     end
 
     def delete_all
       QC.log_yield(:measure => 'queue.delete_all') do
-        s = "DELETE FROM #{TABLE_NAME} WHERE q_name = $1"
+        s = "DELETE FROM #{QC.table_name} WHERE q_name = $1"
         conn_adapter.execute(s, name)
       end
     end
 
+    # Count the number of jobs in a specific queue. This returns all
+    # jobs, including ones that are scheduled in the future.
     def count
-      QC.log_yield(:measure => 'queue.count') do
-        s = "SELECT COUNT(*) FROM #{TABLE_NAME} WHERE q_name = $1"
-        r = conn_adapter.execute(s, name)
+      _count('queue.count', "SELECT COUNT(*) FROM #{QC.table_name} WHERE q_name = $1")
+    end
+
+    # Count the number of jobs in a specific queue, except ones scheduled in the future
+    def count_ready
+      _count('queue.count_scheduled', "SELECT COUNT(*) FROM #{QC.table_name} WHERE q_name = $1 AND scheduled_at <= now()")
+    end
+
+    # Count the number of jobs in a specific queue scheduled in the future
+    def count_scheduled
+      _count('queue.count_scheduled', "SELECT COUNT(*) FROM #{QC.table_name} WHERE q_name = $1 AND scheduled_at > now()")
+    end
+
+    private
+    def _count(metric_name, sql)
+      QC.log_yield(measure: metric_name) do
+        r = conn_adapter.execute(sql, name)
         r["count"].to_i
       end
     end
-
   end
 end
