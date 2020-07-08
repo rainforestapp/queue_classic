@@ -18,5 +18,5 @@ Gem::Specification.new do |s|
 
   s.require_paths = %w[lib]
 
-  s.add_dependency "pg", ">= 0.17", "< 0.19"
+  s.add_dependency "pg", ">= 0.17", "< 1.3"
 end
